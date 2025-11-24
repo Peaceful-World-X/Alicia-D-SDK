@@ -1,14 +1,15 @@
-import serial
-import platform
-import serial.tools.list_ports
-import time
 import os
-from typing import List, Optional
+import platform
 import threading
+import time
 from datetime import datetime
+from typing import List, Optional
 
+import serial
+import serial.tools.list_ports
 # 使用统一的日志器
 from alicia_d_sdk.utils.logger import logger
+
 READ_LENGTH = 50
 DEFAULT_LENGTH = 5
 
@@ -76,6 +77,8 @@ class SerialComm:
                 if os.path.exists(cu_candidate) and os.access(cu_candidate, os.R_OK | os.W_OK):
                     logger.info(f"检测到 macOS 端口 {port}，将优先切换为 {cu_candidate} 用于写入")
                     port = cu_candidate
+            # 记录最终使用的端口，便于后续持久化零点信息
+            self.port_name = port
 
             # Do not force-change baudrate on macOS. Keep user/default and only log.
             if 'cu.usbserial' in port:
@@ -310,39 +313,39 @@ class SerialComm:
             #     pass
             # Minimal frame structure [0xAA] [CMD] [DATA_LEN]
             frames_processed = 0
-            max_frames_per_call = 10 
-            
+            max_frames_per_call = 10
+
             while len(self._rx_buffer) >= 3 and frames_processed < max_frames_per_call:
                 if len(self._rx_buffer) > 200:
                     # print(f" Warning: rx_buffer large ({len(self._rx_buffer)} bytes)")
                     self._rx_buffer.clear()
                     continue
 
-                
+
                 # Step 2: 同步到帧头 0xAA
                 if self._rx_buffer[0] != 0xAA:
                     self._rx_buffer.pop(0)
                     continue
-                
+
                 if self.debug_mode:
                     print(f" Buffer size: {len(self._rx_buffer)} bytes, first bytes: {self._rx_buffer[:min(12, len(self._rx_buffer))]}")
 
                 data_len = self._rx_buffer[2]
-                
+
                 # 验证data_len是否合理（防止异常数据）
                 if data_len > 200:
                     logger.warning(f" Abnormal data_len={data_len}, resyncing")
                     self._rx_buffer.pop(0)
                     continue
-                
+
                 frame_length = data_len + DEFAULT_LENGTH
-                
+
                 # Step 4: 检查缓冲区是否包含完整帧
                 if len(self._rx_buffer) < frame_length:
                     if self.debug_mode:
                         logger.debug(f"⏳ Incomplete frame: need {frame_length}, have {len(self._rx_buffer)}")
                     break
-                
+
                 candidate = self._rx_buffer[:frame_length]
                 # Always print candidate frame in hex
                 # if candidate[1] == 0x12:
@@ -350,7 +353,7 @@ class SerialComm:
                 #     logger.info(f"candidate: {hex_cand}")
                 # if self.debug_mode:
                 #     print(f" Candidate ({frame_length} bytes): {candidate}")
-                
+
                 # Step 5: 验证帧尾和校验
                 valid_tail = candidate[-1] == 0xFF
                 valid_checksum = self._serial_data_check(candidate)
@@ -373,7 +376,7 @@ class SerialComm:
                     self._rx_buffer = self._rx_buffer[frame_length:]
                     frames_processed += 1
                     self._frames_processed += 1
-                    
+
                     if self.debug_mode:
                         print(f"Valid frame processed! ({frames_processed}/{max_frames_per_call}) Remaining: {len(self._rx_buffer)} bytes")
 
@@ -387,7 +390,7 @@ class SerialComm:
                             print(f"⚠ Dropped {self._frames_dropped} invalid frames")
                     self._rx_buffer.pop(0)
                     continue
-            
+
             return None
 
         except Exception as e:
@@ -446,11 +449,11 @@ class SerialComm:
 
         hex_str = " ".join([f"{byte:02X}" for byte in data])
         logger.info(f"{prefix}{hex_str}")
-    
+
     def get_processing_stats(self) -> dict:
         """
         获取帧处理统计信息
-        
+
         Returns:
             dict: 包含处理和丢弃帧数的统计信息
         """

@@ -9,33 +9,35 @@ Responsibilities:
 - Parameter validation and error handling
 """
 
-import time
-from typing import List, Optional, Dict, Union, Tuple
-import numpy as np
 import json
 import os
+import time
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
 # Import from robocore for kinematics and planning
-from robocore.kinematics import inverse_kinematics
+from robocore.kinematics import forward_kinematics, inverse_kinematics
 from robocore.modeling import RobotModel
-from robocore.transform import make_transform, quaternion_to_matrix
-from robocore.kinematics import forward_kinematics
-from robocore.transform import matrix_to_euler, matrix_to_quaternion
-from robocore.planning.trajectory import (
-    cubic_polynomial_trajectory,
-    quintic_polynomial_trajectory,
-    linear_joint_trajectory,
-    linear_cartesian_trajectory,
-)
-from ..hardware import ServoDriver
+from robocore.planning.trajectory import (cubic_polynomial_trajectory,
+                                          linear_cartesian_trajectory,
+                                          linear_joint_trajectory,
+                                          quintic_polynomial_trajectory)
+from robocore.transform import (make_transform, matrix_to_euler,
+                                matrix_to_quaternion, quaternion_to_matrix)
+from robocore.utils.control_utils import (check_and_clip_joint_limits,
+                                          compute_steps_and_delay,
+                                          validate_joint_list)
+
 from ..execution import HardwareExecutor, JointInterpolator
-from ..utils.logger import logger
-from robocore.utils.control_utils import compute_steps_and_delay, validate_joint_list, check_and_clip_joint_limits
+from ..hardware import ServoDriver
 from ..utils.calculate import calculate_movement_duration
+from ..utils.logger import logger
+from ..utils.zero_offset_manager import ZeroOffsetManager
 
 
 class SynriaRobotAPI:
     """Synria robot arm API - provides unified user interface"""
-    
+
     def __init__(self,
                  servo_driver: ServoDriver,
                  robot_model: RobotModel,
@@ -55,16 +57,38 @@ class SynriaRobotAPI:
         self.speed_deg_s = speed_deg_s
         self.firmware_version = firmware_version
         self.firmware_new = False
+        self.zero_offset_manager = ZeroOffsetManager()
+        self._robot_identifier: Optional[str] = None
 
         # 创建各层组件
         self.hardware_executor = HardwareExecutor(servo_driver)
         # 默认参数
         self.home_angles = [0.0] * 6
 
+    # ==================== Internal Helpers ====================
 
-    
+    def _get_joint_offsets(self) -> List[float]:
+        """Return current software zero offsets in radians."""
+        return self.servo_driver.get_joint_offsets()
+
+    def _to_model_frame(self, joints: List[float]) -> List[float]:
+        """Convert calibrated joint angles to the URDF/model frame."""
+        offsets = self._get_joint_offsets()
+        return [float(angle) + float(offset) for angle, offset in zip(joints, offsets)]
+
+    def _to_command_frame(self, joints: List[float]) -> List[float]:
+        """Convert model-frame joint angles back to calibrated (command) frame."""
+        offsets = self._get_joint_offsets()
+        return [float(angle) - float(offset) for angle, offset in zip(joints, offsets)]
+
+    def _trajectory_to_command_frame(self, trajectory: List[List[float]]) -> List[List[float]]:
+        """Batch-convert a joint trajectory from model to command frame."""
+        return [self._to_command_frame(point) for point in trajectory]
+
+
+
     # ==================== Connection Management ====================
-    
+
     def connect(self) -> bool:
         """Connect to robot and detect firmware version.
 
@@ -87,22 +111,52 @@ class SynriaRobotAPI:
                 self.servo_driver.data_parser.firmware_new = True
                 self.firmware_new = True
 
+            self._robot_identifier = self._build_robot_identifier()
+            self._load_zero_offsets()
+
         return result
-    
+
     def disconnect(self):
         """Disconnect from robot and stop update threads."""
         self.servo_driver.stop_update_thread()
         self.servo_driver.disconnect()
-    
+
     def is_connected(self) -> bool:
         """Check if robot is connected.
 
         :return: True if connection is active
         """
         return self.servo_driver.serial_comm.is_connected()
-    
-    # ==================== Robot Control ====================                         
-    
+
+    def _build_robot_identifier(self) -> str:
+        port = self.servo_driver.serial_comm.port_name or "auto"
+        firmware = self.firmware_version or "unknown"
+        gripper = getattr(self.servo_driver, "gripper_type", "unknown")
+        robot_type = getattr(self.servo_driver.data_parser, "robot_type", "follower")
+        return f"{port}|{firmware}|{gripper}|{robot_type}"
+
+    def _load_zero_offsets(self) -> None:
+        if not self._robot_identifier:
+            return
+        offsets = self.zero_offset_manager.load(self._robot_identifier)
+        if offsets:
+            logger.info("检测到持久化零点，正在加载...")
+            self.servo_driver.set_joint_offsets(offsets)
+        else:
+            self.servo_driver.set_joint_offsets(None)
+
+    def _persist_zero_offsets(self, offsets: List[float]) -> None:
+        if not self._robot_identifier:
+            self._robot_identifier = self._build_robot_identifier()
+        metadata = {
+            "port": self.servo_driver.serial_comm.port_name or "auto",
+            "firmware": self.firmware_version or "unknown",
+            "gripper": getattr(self.servo_driver, "gripper_type", "unknown"),
+        }
+        self.zero_offset_manager.save(self._robot_identifier, offsets, metadata=metadata)
+
+    # ==================== Robot Control ====================
+
 
     def set_home(self, speed_factor: float = 1, tolerance: float = 0.03, timeout: float = 10.0):
         """Move robot to home position and wait until near zero.
@@ -164,16 +218,16 @@ class SynriaRobotAPI:
             timeout=max_wait,
             log_prefix="等待关节接近目标"
         )
-    
+
     def set_joint_target_no_wait(self,
                                  target_joints: List[float],
                                  joint_format: str = 'rad') -> bool:
         """Move robot to target joint angles without waiting for completion.
-        
+
         This is a non-blocking version of set_joint_target. The command is sent
         to the robot and the function returns immediately without waiting for
         the robot to reach the target position.
-        
+
         :param target_joints: Target joint angles
         :param joint_format: Unit format, 'rad' or 'deg'
         :return: True if command sent successfully, False otherwise
@@ -182,7 +236,7 @@ class SynriaRobotAPI:
             target_joints = [a * np.pi / 180.0 for a in target_joints]
         return self.servo_driver.set_joint_angles(target_joints)
 
-    
+
     def set_joint_target_interplotation(self,
               target_joints: List[float],
               joint_format: str = 'rad',
@@ -201,39 +255,40 @@ class SynriaRobotAPI:
         :return: True if motion started successfully
         """
         logger.info("[moveJ] 开始执行关节空间插值移动")
-        
+
         if target_joints is None:
             logger.error("[moveJ] 请提供 target_joints 参数")
             return False
-        
+
         # 参数验证和转换
         joint_format = joint_format.lower()
         if joint_format not in ['rad', 'deg']:
             logger.error(f"[moveJ] 不支持的 joint_format: '{joint_format}'，应为 'rad' 或 'deg'")
             return False
-        
+
         # 支持角度制输入
         if joint_format == 'deg':
             logger.info("[moveJ] 输入角度单位为 degree，将转换为 rad")
             target_joints = [a * np.pi / 180.0 for a in target_joints]
-        
+
         # 验证关节列表
         validate_joint_list(target_joints)
-        
-        # 检查关节限位并修正
-        target_joints, violations = check_and_clip_joint_limits(
-            joints=target_joints,
+
+        # 检查关节限位并修正（在模型坐标系中）
+        model_target, violations = check_and_clip_joint_limits(
+            joints=self._to_model_frame(target_joints),
             joint_limits=self.robot_model.joint_limits
         )
-        
+        target_joints = self._to_command_frame(model_target)
+
         for joint_name, original, clipped in violations:
             logger.warning(
                 f"[moveJ] {joint_name} 超出限制：{original:.2f} -> 已截断为 {clipped:.2f}"
             )
-        
+
         # 获取当前状态（直接从servo_driver获取，带重试机制）
         cur_angles = self.get_joints()
-        
+
         # 插值步数与延迟
         steps, delay = compute_steps_and_delay(
             speed_factor=speed_factor,
@@ -247,7 +302,7 @@ class SynriaRobotAPI:
             target_angles=target_joints,
             steps=steps
         )
-        
+
         # 显示起始和目标角度
         if joint_format == 'deg':
             display_cur = [round(a * 180.0 / np.pi, 1) for a in cur_angles]
@@ -257,24 +312,24 @@ class SynriaRobotAPI:
             display_cur = [round(a, 3) for a in cur_angles]
             display_target = [round(a, 3) for a in target_joints]
             unit = "rad"
-        
+
         # 日志输出
         logger.info(f"[moveJ] 起始角度 ({unit}): {display_cur}")
         logger.info(f"[moveJ] 目标角度 ({unit}): {display_target}")
         logger.info(f"[moveJ] 插值步数: {steps}，单步延迟: {delay:.3f}s，预计总耗时: {steps * delay:.1f}s")
-        
+
         # 执行轨迹
         self.hardware_executor.delay = delay
         result = self.hardware_executor.execute(
             joint_traj=joint_traj,
             visualize=visualize
         )
-        
+
         return result if result is not None else True
-    
+
 
     # ==================== Gripper Control ====================
-    
+
     def set_gripper_target(self,
                        command: Optional[str] = None,
                        value: Optional[float] = None,
@@ -293,7 +348,7 @@ class SynriaRobotAPI:
         if command is not None and value is not None:
             logger.error("command 与 value 参数不可同时指定")
             return False
-        
+
         if command is not None:
             if command == "open":
                 value = 100.0  # 打开对应100
@@ -302,17 +357,17 @@ class SynriaRobotAPI:
             else:
                 logger.error("command 参数必须是 'open' 或 'close'")
                 return False
-        
+
         if value is None:
             logger.error("必须提供 command 或 value 参数")
             return False
-        
+
         # 发送夹爪命令
         success = self.servo_driver.set_gripper(value)
         if not success:
             logger.error("夹爪命令发送失败")
             return False
-        
+
         if wait_for_completion:
             start_time = time.time()
             while time.time() - start_time < timeout:
@@ -323,19 +378,19 @@ class SynriaRobotAPI:
                         return True
                 self.servo_driver.set_gripper(value)
                 time.sleep(0.1)
-            
+
             # logger.warning("夹爪运动等待超时")
             return False
-        
+
         return True
 
 
-    def set_pose_target(self, 
-                       target_pose: List[float], 
-                       backend: str = 'numpy', 
-                       method: str = 'dls', 
-                       display: bool = True, 
-                       tolerance: float = 1e-4, 
+    def set_pose_target(self,
+                       target_pose: List[float],
+                       backend: str = 'numpy',
+                       method: str = 'dls',
+                       display: bool = True,
+                       tolerance: float = 1e-4,
                        max_iters: int = 100,
                        multi_start: int = 0,
                        use_random_init: bool = False,
@@ -360,7 +415,7 @@ class SynriaRobotAPI:
         quaternion = np.array(target_pose[3:])
         rotation_matrix = quaternion_to_matrix(quaternion)
         pose_matrix = make_transform(rotation_matrix, position)
-        
+
         # Get initial guess
         if use_random_init:
             # Generate random initial guess within joint limits
@@ -375,12 +430,12 @@ class SynriaRobotAPI:
                     'message': '无法获取当前关节角度',
                     'q': None
                 }
-        
+
         if display:
             logger.info(f"初始关节角度 (rad): {[f'{q:+.4f}' for q in q_init]}")
             logger.info(f"初始关节角度 (deg): {[f'{np.rad2deg(q):+.2f}' for q in q_init]}")
             logger.info(f"正在求解IK (方法: {method}, 最大迭代: {max_iters})...")
-        
+
         # Solve inverse kinematics
         ik_result = inverse_kinematics(
             self.robot_model,
@@ -395,8 +450,13 @@ class SynriaRobotAPI:
             multi_noise=0.3,
             use_analytic_jacobian=True
         )
-        
+
         if ik_result['success']:
+            q_model = list(ik_result['q'])
+            q_command = self._to_command_frame(q_model)
+            ik_result['q_model'] = q_model
+            ik_result['q'] = q_command
+
             if display:
                 logger.info("✓ IK 求解成功!")
                 logger.info(f"  迭代次数: {ik_result['iters']}")
@@ -404,14 +464,14 @@ class SynriaRobotAPI:
                 logger.info(f"  姿态误差: {ik_result['ori_err']:.6e} rad")
                 logger.info(f"  关节角度 (rad): {[f'{q:+.4f}' for q in ik_result['q']]}")
                 logger.info(f"  关节角度 (deg): {[f'{np.rad2deg(q):+.2f}' for q in ik_result['q']]}")
-            
+
             # Execute motion if requested
             if execute:
                 if self.firmware_new:
                     result = self.set_joint_target(ik_result['q'], joint_format='rad')
                 else:
                     result = self.set_joint_target_interplotation(
-                        ik_result['q'], 
+                        ik_result['q'],
                         joint_format='rad',
                         speed_factor=speed_factor
                     )
@@ -420,7 +480,7 @@ class SynriaRobotAPI:
                 ik_result['motion_executed'] = False
                 if display:
                     logger.info("  (未执行运动，execute=False)")
-            
+
             return ik_result
         else:
             error_msg = ik_result.get('message', '未知错误')
@@ -429,38 +489,35 @@ class SynriaRobotAPI:
                 logger.error(f"  迭代次数: {ik_result.get('iters', 'N/A')}")
                 logger.error(f"  位置误差: {ik_result.get('pos_err', float('inf')):.6e} m")
                 logger.error(f"  姿态误差: {ik_result.get('ori_err', float('inf')):.6e} rad")
-            
+
             return ik_result
-    
+
 
 
     def get_joints(self, type: str = "follower") -> Optional[Union[List[float], Tuple[List[float], bool, bool]]]:
-        """Get current joint angles.
-        :param type: 'follower' -> return angles only; other values -> (angles, button1, button2)
-        :return: Angles list, or (angles, button1, button2) if requested; None if unavailable
-        """
-        joint_state = self.data_parser.get_joint_state()
-        if joint_state:
-            if type == "follower":
-                return joint_state.angles
-            return (joint_state.angles, joint_state.button1, joint_state.button2)
-        return None
-    
+        """Get current joint angles relative to软件零点."""
+        joint_state = self.servo_driver.get_joint_state(calibrated=True)
+        if not joint_state:
+            return None
+        if type == "follower":
+            return joint_state.angles
+        return (joint_state.angles, joint_state.button1, joint_state.button2)
+
     def get_pose(self) -> Optional[Union[List[float], Dict]]:
         """Get current end-effector pose.
 
         :return: Dictionary with position, rotation, euler_xyz, quaternion_xyzw, transform
         """
 
-        joint_angles = self.get_joints()
-        if joint_angles is None:
-            logger.error("无法获取关节角度")
+        joint_state_raw = self.servo_driver.get_joint_state(calibrated=False)
+        if joint_state_raw is None:
+            logger.error("无法获取原始关节角度")
             return None
 
         T_fk = forward_kinematics(
-            self.robot_model, 
-            joint_angles, 
-            backend='numpy', 
+            self.robot_model,
+            joint_state_raw.angles,
+            backend='numpy',
             return_end=True
         )
 
@@ -468,7 +525,7 @@ class SynriaRobotAPI:
         rotation_fk = T_fk[:3, :3]
         euler_fk = matrix_to_euler(rotation_fk, seq='xyz')
         quat_fk = matrix_to_quaternion(rotation_fk)
-            
+
         return {
             'transform': T_fk,
             'position': position_fk,
@@ -477,7 +534,7 @@ class SynriaRobotAPI:
             'quaternion_xyzw': quat_fk
         }
 
-    
+
     def get_gripper(self) -> Optional[float]:
         """Get current gripper position.
 
@@ -489,7 +546,7 @@ class SynriaRobotAPI:
             return joint_state.gripper
         return None
 
-    
+
     def get_firmware_version(self, timeout=5.0, send_interval=0.2):
         """Query robot firmware version.
 
@@ -499,7 +556,7 @@ class SynriaRobotAPI:
         """
         command = [0xAA, 0x0A, 0x01, 0x00, 0x00, 0xFF]
         start_time = time.time()
-        
+
         # Check if the firmware version is already in the json file
         if os.path.exists(os.path.join(os.path.dirname(__file__), "firmware_version.json")):
             with open(os.path.join(os.path.dirname(__file__), "firmware_version.json"), "r") as f:
@@ -507,7 +564,7 @@ class SynriaRobotAPI:
                 self.firmware_version = firmware_version
         else:
             firmware_version = None
-        
+
         if firmware_version:
             return firmware_version
 
@@ -529,9 +586,9 @@ class SynriaRobotAPI:
             time.sleep(send_interval)
 
         return None
-    
+
     # ==================== Advanced Trajectory Methods ====================
-    
+
     def move_joint_trajectory(self,
                              q_end: List[float],
                              duration: float = 2.0,
@@ -551,23 +608,23 @@ class SynriaRobotAPI:
         if q_start is None:
             logger.error("无法获取当前关节角度")
             return False
-        
+
         q_start = np.array(q_start)
         q_end = np.array(q_end)
-        
+
         # 检查关节限位
-        q_end, violations = check_and_clip_joint_limits(
-            joints=q_end.tolist(),
+        q_end_model, violations = check_and_clip_joint_limits(
+            joints=self._to_model_frame(q_end.tolist()),
             joint_limits=self.robot_model.joint_limits
         )
-        q_end = np.array(q_end)
-        
+        q_end = np.array(self._to_command_frame(q_end_model))
+
         for joint_name, original, clipped in violations:
             logger.warning(f"{joint_name} 超出限制：{original:.2f} -> {clipped:.2f}")
-        
+
         # 生成轨迹
         logger.info(f"使用 {method} 插值生成关节轨迹 (时长: {duration}s, 点数: {num_points})")
-        
+
         if method == 'linear':
             _, q, _, _ = linear_joint_trajectory(q_start, q_end, duration, num_points)
         elif method == 'cubic':
@@ -577,18 +634,18 @@ class SynriaRobotAPI:
         else:
             logger.error(f"不支持的插值方法: {method}")
             return False
-        
+
         # 执行轨迹
         delay = duration / num_points
         self.hardware_executor.delay = delay
-        
+
         result = self.hardware_executor.execute(
             joint_traj=q.tolist(),
             visualize=visualize
         )
-        
+
         return result if result is not None else True
-    
+
     def move_cartesian_linear(self,
                              target_pose: List[float],
                              duration: float = 2.0,
@@ -609,24 +666,24 @@ class SynriaRobotAPI:
         if current_pose_dict is None:
             logger.error("无法获取当前位姿")
             return False
-        
+
         pose_start = current_pose_dict['transform']
-        
+
         # 构建目标位姿矩阵
         position = np.array(target_pose[:3])
         quaternion = np.array(target_pose[3:])
         rotation_matrix = quaternion_to_matrix(quaternion)
         pose_end = make_transform(rotation_matrix, position)
-        
-        # 获取当前关节角度作为IK初始猜测
-        q_init = self.get_joints()
-        if q_init is None:
-            logger.error("无法获取当前关节角度")
+
+        # 获取原始关节角度作为IK初始猜测
+        joint_state_raw = self.servo_driver.get_joint_state(calibrated=False)
+        if joint_state_raw is None:
+            logger.error("无法获取原始关节角度")
             return False
-        q_init = np.array(q_init)
-        
+        q_init = np.array(joint_state_raw.angles)
+
         logger.info(f"生成笛卡尔直线轨迹 (时长: {duration}s, 点数: {num_points})")
-        
+
         # 生成轨迹
         try:
             _, _, q = linear_cartesian_trajectory(
@@ -635,7 +692,7 @@ class SynriaRobotAPI:
                 pose_end,
                 duration,
                 num_points=num_points,
-                q_init=None,
+                q_init=q_init.tolist(),
                 ik_backend='numpy',
                 ik_method=ik_method,
                 max_iters=500,
@@ -645,22 +702,24 @@ class SynriaRobotAPI:
         except Exception as e:
             logger.error(f"轨迹规划失败: {e}")
             return False
-        
+
         # 执行轨迹
         delay = duration / num_points
         self.hardware_executor.delay = delay
-        
+
         logger.info(f"执行笛卡尔轨迹 (总点数: {len(q)})")
 
-        result = self.hardware_executor.execute(
-            joint_traj=q.tolist(),
-            visualize=visualize, 
-        )
-        
-        return result if result is not None else True
-    
+        command_traj = self._trajectory_to_command_frame(q.tolist())
 
-    
+        result = self.hardware_executor.execute(
+            joint_traj=command_traj,
+            visualize=visualize,
+        )
+
+        return result if result is not None else True
+
+
+
     # ==================== System Control ====================
     def set_acceleration(self, acceleration: int = 1) -> bool:
         """Set robot acceleration.
@@ -678,8 +737,8 @@ class SynriaRobotAPI:
         """
         speed_rad_s = np.deg2rad(speed_deg_s)
         return self.servo_driver.set_speed(speed_rad_s)
-    
-    
+
+
     def torque_control(self, command: str) -> bool:
         """Enable or disable robot torque.
 
@@ -695,7 +754,7 @@ class SynriaRobotAPI:
         else:
             logger.error("command 参数必须是 'on' 或 'off'")
             return False
-    
+
     def zero_calibration(self) -> bool:
         """Execute zero position calibration procedure.
 
@@ -711,25 +770,39 @@ class SynriaRobotAPI:
             return False
         logger.info("请手动拖动机械臂到零点位置，然后按回车继续...")
         input()
-        
-        # 重新开启扭矩
+
+        # 采集当前硬件角度并更新软件零点
+        logger.info("正在记录当前姿态为新的零点，请保持机械臂静止...")
+        joint_state_raw = self.servo_driver.get_joint_state(calibrated=False)
+        if joint_state_raw is None:
+            logger.error("无法读取关节角度，归零取消")
+            return False
+        new_offsets = list(joint_state_raw.angles)
+        self.servo_driver.set_joint_offsets(new_offsets)
+        self._persist_zero_offsets(new_offsets)
+        logger.info("软件零点偏移已保存，后续命令将以该姿态为零位")
+
+        # 执行硬件层零点指令（部分固件需要保存EEPROM）
+        result = self.servo_driver.set_zero_position()
+
+        if not result:
+            logger.warning("硬件零点指令发送失败，但软件零点已更新")
+
+        time.sleep(0.5)
+
+        # 重新开启扭矩以锁定新的零点
         if not self.torque_control('on'):
             logger.error("扭矩开启失败")
             return False
-        
-        # 执行零点校准
-        result = self.servo_driver.set_zero_position()
-        if result:
-            logger.info("归零校准成功")
-        else:
-            logger.error("归零校准失败")
-        
-        return result
-    
 
-    
+        logger.info("归零校准完成。运行 03_demo_read_state.py 可验证关节是否接近 0°")
 
-    
+        return True
+
+
+
+
+
     def print_state(self, continuous: bool = False, output_format: str = "deg", robot_type: str = "follower"):
         """Print current robot state.
 
@@ -787,7 +860,7 @@ class SynriaRobotAPI:
                 logger.info("停止连续状态打印")
         else:
             _print_once(robot_type)
-    
+
 
     def _generate_random_q(self, scale: float = 0.5) -> List[float]:
         """Generate random joint configuration within limits.
@@ -797,7 +870,7 @@ class SynriaRobotAPI:
         """
         rng = np.random.default_rng()
         q = [0.0] * self.robot_model.num_dof()
-        
+
         for js in self.robot_model._actuated:
             lo, hi = -1.0, 1.0
             if js.limit:
@@ -808,7 +881,7 @@ class SynriaRobotAPI:
             mid = 0.5 * (lo + hi)
             span = 0.5 * (hi - lo) * scale
             q[js.index] = float(rng.uniform(mid - span, mid + span))
-        
+
         return q
 
 
@@ -838,7 +911,7 @@ class SynriaRobotAPI:
 
         logger.warning("等待关节到目标附近超时")
         return False
-    
+
 
     def __del__(self):
         try:
