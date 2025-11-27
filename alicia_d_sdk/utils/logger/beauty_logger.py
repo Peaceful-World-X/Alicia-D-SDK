@@ -17,7 +17,7 @@ class BeautyLogger:
     Lightweight logger for Alicia-D-SDK package.
     """
 
-    def __init__(self, log_dir: str, log_name: str = 'rofunc.log', verbose: bool = True, min_level: int = LogLevel.INFO):
+    def __init__(self, log_dir: str, log_name: str = 'rofunc.log', verbose: bool = True, min_level: int = LogLevel.INFO, enable_file: bool = True):
         """
         Alicia-D-SDK轻量级日志器
 
@@ -25,18 +25,22 @@ class BeautyLogger:
         :param log_name: 日志文件名
         :param verbose: 是否在控制台打印日志
         :param min_level: 最小日志级别
+        :param enable_file: 是否启用日志文件写入
         """
         self.log_dir = log_dir
         self.log_name = log_name
         self.log_path = os.path.join(self.log_dir, self.log_name)
         self.verbose = verbose
         self.min_level = min_level
+        self.enable_file = enable_file
 
-        os.makedirs(self.log_dir, exist_ok=True)
-        
+        if self.enable_file:
+            os.makedirs(self.log_dir, exist_ok=True)
+
     def _write_log(self, content, type):
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(" Alicia-D-SDK:{}] {}\n".format(type.upper(), content))
+        if self.enable_file:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(" Alicia-D-SDK:{}] {}\n".format(type.upper(), content))
 
     def _should_print(self, level: int) -> bool:
         """
@@ -93,7 +97,7 @@ class BeautyLogger:
     def debug(self, content, local_verbose=True):
         """
         打印调试消息
-        
+
         :param content: 调试消息内容
         :param local_verbose: 是否在控制台打印
         """
@@ -104,7 +108,7 @@ class BeautyLogger:
     def error(self, content, local_verbose=True):
         """
         打印错误消息
-        
+
         :param content: 错误消息内容
         :param local_verbose: 是否在控制台打印
         """
@@ -116,7 +120,7 @@ class BeautyLogger:
     def success(self, content, local_verbose=True):
         """
         打印成功消息
-        
+
         :param content: 成功消息内容
         :param local_verbose: 是否在控制台打印
         """
