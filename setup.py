@@ -16,11 +16,13 @@ def parse_requirements(filename):
     """
     install_requires = []
     dependency_links = []
-    
+
     requirements_path = os.path.join(os.path.dirname(__file__), filename)
     if not os.path.exists(requirements_path):
         return [], []
-        
+
+    base_dir = os.path.dirname(__file__)
+
     with open(requirements_path, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
@@ -31,10 +33,40 @@ def parse_requirements(filename):
                     install_requires.append(pkg_name)
                     # The full URL goes into dependency_links
                     dependency_links.append(line)
+                elif '@' in line:
+                    # Handle package @ URL or file path format
+                    # e.g., "synriard @ ./bin/Synria-Robot-Descriptions.zip"
+                    parts = line.split('@', 1)
+                    pkg_name = parts[0].strip()
+                    path_or_url = parts[1].strip()
+
+                    # Convert relative file path to absolute path with file:// URL
+                    if path_or_url.startswith('./') or path_or_url.startswith('../'):
+                        # Relative path: convert to absolute
+                        abs_path = os.path.abspath(os.path.join(base_dir, path_or_url))
+                        if os.path.exists(abs_path):
+                            file_url = f"file://{abs_path}"
+                            install_requires.append(f"{pkg_name} @ {file_url}")
+                        else:
+                            print(f"Warning: File not found: {abs_path}, skipping dependency")
+                    elif path_or_url.startswith('file://'):
+                        # Already a file:// URL, use as-is
+                        install_requires.append(line)
+                    elif not path_or_url.startswith(('http://', 'https://', 'git+')):
+                        # Assume it's a relative path without ./
+                        abs_path = os.path.abspath(os.path.join(base_dir, path_or_url))
+                        if os.path.exists(abs_path):
+                            file_url = f"file://{abs_path}"
+                            install_requires.append(f"{pkg_name} @ {file_url}")
+                        else:
+                            print(f"Warning: File not found: {abs_path}, skipping dependency")
+                    else:
+                        # Already a URL (http/https/git+), use as-is
+                        install_requires.append(line)
                 else:
                     # Standard PyPI packages go into install_requires
                     install_requires.append(line)
-                    
+
     return install_requires, dependency_links
 
 # 从 __init__.py 读取版本号
@@ -59,7 +91,7 @@ setup(
     name='alicia_d_sdk',
     version=get_version(),
     author='Synria Robotics',
-    author_email='support@synriarobotics.ai', 
+    author_email='support@synriarobotics.ai',
     description='Python SDK for controlling the Alicia D robotic arm',
     long_description=read_readme(),
     long_description_content_type='text/markdown',

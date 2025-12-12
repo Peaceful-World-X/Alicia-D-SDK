@@ -11,12 +11,9 @@ from alicia_d_sdk import create_robot
 
 robot = create_robot(
     port="",                    # 串口（留空自动查找）
-    baudrate=1000000,           # 波特率
     robot_version="v5_6",       # 机械臂结构版本
     gripper_type="50mm",        # 夹爪类型
-    firmware_version=None,      # 固件版本（自动检测）
     debug_mode=False,           # 调试模式
-    speed_deg_s=20.0           # 默认速度（度/秒），建议使用默认值
 )
 ```
 
@@ -33,66 +30,61 @@ robot = create_robot()
 ### 主要方法一览：
 
 #### 连接管理：
-- `connect()`
+- `connect()`  
   连接机械臂并检测固件版本
 
-- `disconnect()`
+- `disconnect()`  
   断开机械臂连接并停止更新线程
 
-- `is_connected()`
+- `is_connected()`  
   检查机械臂是否连接
 
 #### 运动控制：
-- `set_home(speed_factor=1.0)`
+- `set_home(speed_factor=1.0)`  
   移动机械臂到初始位置
 
-- `set_joint_target(target_joints, joint_format='rad')`
+- `set_joint_target(target_joints, joint_format='rad')`  
   移动机械臂到目标关节角度（直接设置，新固件）
 
-- `set_joint_target_interplotation(target_joints, joint_format='rad', speed_factor=1.0, T_default=4.0, n_steps_ref=200, visualize=False)`
+- `set_joint_target_interplotation(target_joints, joint_format='rad', speed_factor=1.0, T_default=4.0, n_steps_ref=200, visualize=False)`  
   使用插值平滑移动机械臂到目标关节角度（旧固件）
 
-- `set_pose_target(target_pose, backend='numpy', method='dls', display=True, tolerance=1e-4, max_iters=100, multi_start=0, use_random_init=False, speed_factor=1.0, execute=True)`
-  使用逆运动学移动末端执行器到目标位姿。返回结果中的 `q` 为可直接用于 `set_joint_target` 的指令角度，同时保留 `q_model` 字段用于查看 URDF 模型坐标下的原始解。
+- `set_pose_target(target_pose, backend='numpy', method='dls', display=True, tolerance=1e-4, max_iters=100, multi_start=0, use_random_init=False, speed_factor=1.0, execute=True)`  
+  使用逆运动学移动末端执行器到目标位姿
 
-- `move_joint_trajectory(q_end, duration=2.0, method='cubic', num_points=100, visualize=False)`
+- `move_joint_trajectory(q_end, duration=2.0, method='cubic', num_points=100, visualize=False)`  
   执行平滑的关节轨迹到目标位置
 
-- `move_cartesian_linear(target_pose, duration=2.0, num_points=50, ik_method='dls', visualize=False)`
+- `move_cartesian_linear(target_pose, duration=2.0, num_points=50, ik_method='dls', visualize=False)`  
   执行笛卡尔直线轨迹到目标位姿
 
 #### 状态获取：
-- `get_joints()`
+- `get_joints()`  
   返回当前关节角度（弧度）
 
-- `get_pose()`
-  获取当前末端执行器位置与姿态，返回字典包含 `transform`, `position`, `rotation`, `euler_xyz`, `quaternion_xyzw`。该姿态始终以 URDF 模型坐标系为准，不会因软件零点偏移而改变基座原点。
+- `get_pose()`  
+  获取当前末端执行器位置与姿态，返回字典包含 `transform`, `position`, `rotation`, `euler_xyz`, `quaternion_xyzw`
 
-- `get_gripper()`
+- `get_gripper()`  
   返回当前夹爪开合度（0-100）
 
-- `get_firmware_version(timeout=5.0, send_interval=0.2)`
+- `get_firmware_version(timeout=5.0, send_interval=0.2)`  
   查询机械臂固件版本
 
-- `print_state(continuous=False, output_format='deg')`
+- `print_state(continuous=False, output_format='deg')`  
   打印当前机械臂信息，可持续打印，支持角度/弧度格式
 
 #### 夹爪控制：
-- `set_gripper_target(command=None, value=None, wait_for_completion=True, timeout=5.0, tolerance=1.0)`
+- `set_gripper_target(command=None, value=None, wait_for_completion=True, timeout=5.0, tolerance=1.0)`  
   控制夹爪位置，command 可选 'open' 或 'close'，value 范围 0-100
 
 #### 系统控制：
-- `torque_control(command)`
+- `torque_control(command)`  
   启用或关闭扭矩（'on' 或 'off'）
 
-- `zero_calibration()`
+- `zero_calibration()`  
   执行归零校准流程：关闭扭矩 → 手动拖动 → 重启扭矩 → 记录零点
 
-- `set_speed(speed_deg_s)`
-  设置机械臂运动速度（度/秒，仅新固件）
-
-- `set_acceleration(acceleration)`
-  设置机械臂加速度
 
 ---
 
@@ -107,7 +99,6 @@ robot = create_robot()
 - `set_gripper(...)`
 - `enable_torque()` / `disable_torque()`
 - `set_zero_position()`
-- `set_speed(...)` / `set_acceleration(...)`
 
 不推荐用户直接使用此类，建议通过 `SynriaRobotAPI` 高级接口操作。
 

@@ -5,5 +5,8 @@ matplotlib>=3.3.0
 pyyaml>=6.0
 omegaconf>=2.3.0
 websockets==13.1
-robocore @ git+https://github.com/Synria-Robotics/RoboCore.git
-synriard @ git+https://github.com/Synria-Robotics/Synria-Robot-Descriptions.git
+pythoncrc
+pycrc
+synria-robocore==1.0.0
+synriard @ ./bin/Synria-Robot-Descriptions.zip
+# synriard @ git+https://github.com/Synria-Robotics/Synria-Robot-Descriptions.git

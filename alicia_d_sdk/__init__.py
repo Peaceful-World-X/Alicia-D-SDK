@@ -15,9 +15,9 @@ Bridge with RoboCore:
 - robocore.modeling: 提供 RobotModel
 """
 
-from .api import SynriaRobotAPI
-from .hardware import ServoDriver
-from .execution import HardwareExecutor
+from alicia_d_sdk.api import SynriaRobotAPI
+from alicia_d_sdk.hardware import ServoDriver
+from alicia_d_sdk.execution import HardwareExecutor
 
 # Import from RoboCore for kinematics and modeling
 from robocore.modeling import RobotModel
@@ -30,9 +30,9 @@ from robocore.planning import (
     trapezoidal_velocity_profile
 )
 
-__version__ = "6.0.0"
+__version__ = "6.1.0"
 __author__ = "Synria Robotics"
-__description__ = "Alicia-D机械臂SDK v6.0.0 - Bridged with RoboCore"
+__description__ = "Alicia-D机械臂SDK v6.1.0 - Bridged with RoboCore"
 
 # Re-export RoboCore components for convenience
 __all__ = [
@@ -40,22 +40,21 @@ __all__ = [
     "SynriaRobotAPI",
     "create_robot",
     "create_session",
-    
+
     # Hardware Layer
     "ServoDriver",
-    
-    
+
     # Execution Layer
     "HardwareExecutor",
-    
+
     # RoboCore - Modeling
     "RobotModel",
-    
+
     # RoboCore - Kinematics
     "forward_kinematics",
     "inverse_kinematics",
     "jacobian",
-    
+
     # RoboCore - Planning
     "cubic_polynomial_trajectory",
     "quintic_polynomial_trajectory",
@@ -66,26 +65,23 @@ __all__ = [
 
 
 def create_robot(
-        port: str = "", 
-        baudrate: int = 1000000, 
-        robot_version: str = "v5_6",
-        robot_type: str = "follower",
-        gripper_type: str = "50mm",
-        firmware_version: None = None,
-        debug_mode: bool = False,
-        speed_deg_s: float = 10.0
-    ) -> SynriaRobotAPI:
+    port: str = "",
+    robot_version: str = "v5_6",
+    gripper_type: str = "50mm",
+    debug_mode: bool = False,
+) -> SynriaRobotAPI:
     """
+    Create robot instance.
+
     :param port: Serial port
-    :param baudrate: Baud rate
     :param robot_version: Robot version (e.g., "v5_6", "v5_4")
     :param gripper_type: Gripper type (e.g., "50mm", "30mm")
     :param debug_mode: Debug mode
-    :return: Robot API instance
+    :return: SynriaRobotAPI instance
     """
     # 创建硬件层
-    servo_driver = ServoDriver(port=port, baudrate=baudrate, debug_mode=debug_mode, firmware_version=firmware_version, robot_type=robot_type)
-    
+    servo_driver = ServoDriver(port=port, debug_mode=debug_mode)
+
     # 创建运动学层 (使用 RoboCore)
     try:
         from synriard import get_model_path
@@ -101,13 +97,11 @@ def create_robot(
             robot_model = RobotModel(str(default_urdf), end_link='tool0')
         else:
             raise FileNotFoundError(f"Cannot find URDF file for {robot_version}")
-    
+
     # 创建用户层 (不再需要 ik_controller，直接使用 robocore.kinematics 函数)
     robot = SynriaRobotAPI(
         servo_driver=servo_driver,
-        robot_model=robot_model, 
-        firmware_version=firmware_version,
-        speed_deg_s = speed_deg_s
+        robot_model=robot_model
     )
-    
+
     return robot

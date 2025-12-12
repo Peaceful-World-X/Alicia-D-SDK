@@ -41,9 +41,11 @@ venv.bak/
 *.swp
 *.swo
 .DS_Store
+*.json
 
-logs/
+logs
+Synria-Robot-Descriptions
+bin
 # Other
 # Thumbs.db
 # ehthumbs.db
-alicia_d_sdk/api/firmware_version.json

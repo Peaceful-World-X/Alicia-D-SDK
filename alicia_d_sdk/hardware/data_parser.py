@@ -1,389 +1,463 @@
 import math
 import time
-from typing import List, Dict, Optional, NamedTuple
+from typing import List, Dict, Optional, NamedTuple, Union
 import threading
 import copy
 from alicia_d_sdk.utils.logger import logger
 
-# 使用统一的日志器
 
 class JointState(NamedTuple):
-    """关节状态数据结构"""
-    angles: List[float]  # 六个关节角度(弧度)
-    gripper: float       # 夹爪角度(弧度)
-    timestamp: float     # 时间戳(秒)
-    button1: bool        # 按钮1状态
-    button2: bool        # 按钮2状态
+    """Joint state data structure."""
+    angles: List[float]  # Six joint angles (radians)
+    gripper: float       # Gripper value
+    timestamp: float     # Timestamp (seconds)
+    run_status_text: str  # Run status text
+
 
 class DataParser:
-    """机械臂数据解析模块"""
-    # 常量定义
-    DEG_TO_RAD = math.pi / 180.0  # 角度转弧度系数
-    RAD_TO_DEG = 180.0 / math.pi  # 弧度转角度系数
-    
-    # 指令ID
-    CMD_GRIPPER_V5 = 0x02     # 夹爪控制与行程反馈
-    CMD_GRIPPER_V6 = 0x12     # 夹爪控制与行程反馈
-    CMD_GRIPPER = 0x12     # 夹爪控制与行程反馈
-    CMD_ZERO_POS = 0x03    # 机械臂以当前位置为零点
-    CMD_JOINT_V5 = 0x04       # 机械臂角度反馈与控制  
-    CMD_JOINT_V6 = 0x14       # 机械臂角度反馈与控制
-    CMD_JOINT = 0x14       # 机械臂角度反馈与控制
-    CMD_MULTI_ARM = 0x06   # 四机械臂角度反馈与控制
-    CMD_VERSION = 0x0A     # 机械臂固件版本反馈
-    CMD_TORQUE = 0x13      # 机械臂力矩控制
-    CMD_ERROR = 0xEE       # 错误反馈
+    """Robot arm data parsing module."""
+    # Constants
+    DEG_TO_RAD = math.pi / 180.0  # Degrees to radians
+    RAD_TO_DEG = 180.0 / math.pi  # Radians to degrees
+
+    # Command IDs
+    CMD_GRIPPER = 0x04     # Gripper control and travel feedback
+    CMD_GRIPPER_V6 = 0x12  # Gripper control for V6 firmware
+    CMD_ZERO_POS = 0x03    # Set current position as zero
+    CMD_JOINT = 0x06       # Joint angle feedback and control
+    CMD_VERSION = 0x01     # Firmware version feedback
+    CMD_TORQUE = 0x05      # Torque control
+    CMD_ERROR = 0xEE       # Error feedback
+    CMD_SELF_CHECK = 0xFE  # Machine self-check (servo health)
     GRI_MAX_50MM = 3290
     GRI_MAX_100MM = 3600
-    # 数据长度
+    # Data sizes
     JOINT_DATA_SIZE = 18
-    
-    def __init__(self, lock: threading.Lock, debug_mode: bool = False, gripper_type: str = "50mm", robot_type: str = "follower"):
+
+    def __init__(self, lock: threading.Lock, debug_mode: bool = False):
         """
-        初始化数据解析器
-        
-        Args:
-            debug_mode: 是否启用调试模式
+        Initialize data parser.
+
+        :param lock: Shared threading lock for concurrent access
+        :param debug_mode: Whether to enable debug logging
         """
         self.debug_mode = debug_mode
-        if gripper_type == "50mm":
-            self.servo_value_limit = self.GRI_MAX_50MM
-        else:
-            self.servo_value_limit = self.GRI_MAX_100MM 
-        # 存储最新数据
-        self._joint_states = JointState([0.0]*6, 0.0, 0.0,
-                                        False, False)  # 六个关节角度(弧度)
 
-        self.robot_type = robot_type
+        # Store latest joint state
+        self._joint_states = JointState([0.0]*6, 0.0, 0.0, "idle")
+
         self._firmware_version: Optional[str] = None
+        # Full version information dict: serial, hardware, firmware
+        self._version_info: Optional[Dict[str, str]] = None
         self._lock = lock
-        logger.info("初始化数据解析模块")
-        if debug_mode:
-            logger.info("调试模式: 启用")
-    
+
+        # Store run status from joint data
+        self._run_status: Optional[int] = None
+        self._run_status_text: Optional[str] = None
+
+        # Store temperature data (in Celsius)
+        self._temperature_data: Optional[List[float]] = None
+        self._temperature_timestamp: Optional[float] = None
+
+        # Store velocity data (in degrees per second)
+        self._velocity_data: Optional[List[float]] = None
+        self._velocity_timestamp: Optional[float] = None
+
+        # Event-based synchronization for async data acquisition
+        # Events are set when corresponding data is received and parsed
+        self._version_event = threading.Event()
+        self._joint_event = threading.Event()
+        self._gripper_event = threading.Event()
+        self._temperature_event = threading.Event()
+        self._velocity_event = threading.Event()
+        self._self_check_event = threading.Event()
+
+        # Mapping from info type to corresponding event
+        self._info_event_map = {
+            "version": self._version_event,
+            "joint": self._joint_event,
+            "gripper": self._gripper_event,
+            "temperature": self._temperature_event,
+            "velocity": self._velocity_event,
+            "self_check": self._self_check_event,
+        }
+
+        # Store self-check (servo health) data
+        self._self_check_raw_mask: Optional[int] = None
+        self._self_check_bits: Optional[List[bool]] = None
+        self._self_check_timestamp: Optional[float] = None
+
     def parse_frame(self, frame: List[int]) -> Optional[Dict]:
         """
-        解析数据帧
-        
-        Args:
-            frame: 完整的数据帧(字节列表)
-            
-        Returns:
-            Dict: 解析结果，如果解析失败则返回None
+        Parse a full data frame.
+
+        :param frame: Complete data frame (byte list)
         """
         cmd_id = frame[1]
-        if cmd_id == self.CMD_JOINT_V5 or cmd_id == self.CMD_JOINT_V6:
-            return self._parse_joint_data(frame)
-        elif cmd_id == self.CMD_GRIPPER_V5:
-            return self._parse_gripper_data_old(frame)
-        elif cmd_id == self.CMD_GRIPPER_V6:
-            return self._parse_gripper_data(frame, robot_type=self.robot_type)
+        if cmd_id == self.CMD_VERSION:
+            return self._parse_version_data(frame)
+        elif cmd_id == self.CMD_JOINT:
+            # Check function code to determine which parser to use
+            func_code = frame[2]
+            if func_code == 0x00:
+                return self._parse_joint_data(frame)
+            elif func_code == 0x01:
+                return self._parse_temperature_data(frame)
+            elif func_code == 0x02:
+                return self._parse_velocity_data(frame)
+            else:
+                if self.debug_mode:
+                    logger.debug(f"Unhandled function code in CMD_JOINT: 0x{func_code:02X}")
+                return None
         elif cmd_id == self.CMD_ERROR:
             return self._parse_error_data(frame)
-        elif cmd_id == self.CMD_VERSION:
-            return self._parse_version_data(frame)
+        elif cmd_id == self.CMD_SELF_CHECK:
+            return self._parse_self_check_data(frame)
         else:
             if self.debug_mode:
-                logger.debug(f"未处理的指令ID: 0x{cmd_id:02X}")
+                logger.debug(f"Unhandled command ID: 0x{cmd_id:02X}")
             return None
-    
+
     def get_joint_state(self) -> Optional[JointState]:
         """
-        获取关节状态
-        
-        Returns:
-            Optional[JointState]: 当前关节状态，如果尚未更新则返回None
+        Get current joint state.
         """
         with self._lock:
             js = self._joint_states
+            # print("self joint states:", js)
             if js.angles is None or js.timestamp is None:
-                logger.warning("机械臂状态尚未更新")
+                logger.warning("Robot state has not been updated yet")
                 return None
             return copy.deepcopy(self._joint_states)
-        
-    def get_firmware_version(self) -> Optional[str]:
+
+    def get_version_info(self) -> Optional[Dict[str, str]]:
         """
-        获取固件版本信息
-        
-        Returns:
-            Optional[str]: 固件版本字符串，如果尚未获取则返回None
+        Get full version information.
+
+        :return: Dictionary with keys: serial_number, hardware_version, firmware_version, or None if not available
         """
         with self._lock:
-            # print("firmware in data_parser:", self._firmware_version)
-            return self._firmware_version
-        
+            if self._version_info is None:
+                return None
 
+            return dict(self._version_info)
+
+    def get_temperature_data(self) -> Optional[Dict[str, any]]:
+        """
+        Get current temperature data.
+
+        :return: Dictionary with keys: temperatures (List of temperatures in Celsius), timestamp, or None if not available
+        """
+        with self._lock:
+            if self._temperature_data is None:
+                return None
+            return {
+                "temperatures": list(self._temperature_data),
+                "timestamp": self._temperature_timestamp
+            }
+
+    def get_velocity_data(self) -> Optional[Dict[str, any]]:
+        """
+        Get current velocity data.
+
+        :return: Dictionary with keys: velocities (List of velocities in degrees per second), timestamp, or None if not available
+        """
+        with self._lock:
+            if self._velocity_data is None:
+                return None
+            return {
+                "velocities": list(self._velocity_data),
+                "timestamp": self._velocity_timestamp
+            }
+
+    def get_self_check_data(self) -> Optional[Dict[str, any]]:
+        """
+        Get latest machine self-check (servo health) result.
+
+        :return: Dictionary with keys: raw_mask (Integer bit mask, LSB = servo 1), bits (List[bool], True = OK, False = fault), timestamp, or None if not available
+        """
+        with self._lock:
+            if self._self_check_raw_mask is None or self._self_check_bits is None:
+                return None
+            return {
+                "raw_mask": int(self._self_check_raw_mask),
+                "bits": list(self._self_check_bits),
+                "timestamp": self._self_check_timestamp,
+            }
+
+    def wait_for_info(self, info_type: str, timeout: float = 2.0) -> bool:
+        """
+        Wait for specified info type to be received and parsed.
+
+        :param info_type: Type of information to wait for (version, joint, gripper, etc.)
+        :param timeout: Maximum time to wait in seconds
+        """
+        if info_type not in self._info_event_map:
+            raise ValueError(f"Unsupported info type: {info_type}. Supported types: {list(self._info_event_map.keys())}")
+
+        event = self._info_event_map[info_type]
+        return event.wait(timeout)
 
     def _update_joint_state(self,
-                        angles: Optional[List[float]] = None,
-                        gripper: Optional[float] = None,
-                        button1: Optional[bool] = None,
-                        button2: Optional[bool] = None):
+                            angles: Optional[List[float]] = None,
+                            gripper: Optional[float] = None,
+                            run_status_text: Optional[str] = None):
         with self._lock:
             prev = self._joint_states
             self._joint_states = JointState(
                 angles=angles if angles is not None else prev.angles,
                 gripper=gripper if gripper is not None else prev.gripper,
                 timestamp=time.time(),
-                button1=button1 if button1 is not None else prev.button1,
-                button2=button2 if button2 is not None else prev.button2,
+                run_status_text=run_status_text if run_status_text is not None else prev.run_status_text
             )
-
 
     def _parse_joint_data(self, frame: List[int]) -> Dict:
         """
-        解析关节数据帧 (0x04)
-        
-        Args:
-            frame: 完整的数据帧
-            
-        Returns:
-            Dict: 解析结果
+        Parse joint data frame.
+
+        :param frame: Complete data frame
         """
-        # 检查数据长度
-        # print(f"帧长度: {len(frame)}")
-        # # print frame in hex format:
-        # frame_hex = " ".join([f"{b:02X}" for b in frame])
-        # logger.info(f"接收到的帧: {frame_hex}")
-        if frame[2] != self.JOINT_DATA_SIZE:  # 0x12对应十进制18 (9个舵机 * 2字节)
-            logger.warning(f"关节数据长度错误: {frame[2]}")
+
+        # 灵动系列 DATA layout:
+        #   - 6 joint angles (each 2 bytes, low byte first)
+        #   - 1 gripper position (2 bytes)
+        #   - 1 run status (1 byte)
+        #
+        # Total DATA length = 6*2 + 2 + 1 = 15 bytes (LEN should be >= 0x0F, example shows 0x10).
+
+        # Basic length check: header(1)+CMD(1)+func(1)+LEN(1)+DATA(LEN)+checksum(1)+footer(1)
+
+        data_len = frame[3]
+        expected_min_len = 4 + data_len + 2  # header+cmd+func+LEN + DATA + checksum+footer
+        if len(frame) < expected_min_len:
+            logger.warning(f"Joint frame length mismatch: LEN={data_len}, frame_len={len(frame)}")
             return None
-        
-        # 舵机到关节的映射表 - 与ROS一致
-        servo_to_joint_map = {
-            0: (0, 1.0),    # 舵机1 -> 关节1 (正向)
-            1: None,        # 舵机2 -> 忽略(重复)
-            2: (1, 1.0),    # 舵机3 -> 关节2 (正向)
-            3: None,        # 舵机4 -> 忽略(重复反向)
-            4: (2, 1.0),    # 舵机5 -> 关节3 (正向)
-            5: None,        # 舵机6 -> 忽略(重复反向)
-            6: (3, 1.0),    # 舵机7 -> 关节4 (正向)
-            7: (4, 1.0),    # 舵机8 -> 关节5 (正向)
-            8: (5, 1.0),    # 舵机9 -> 关节6 (正向)
+
+        data_start = 4
+        data_end = data_start + data_len
+        data_bytes = frame[data_start:data_end]
+
+        # print frame, data bytes in hex
+        # print(f"frame: {' '.join(f'{b:02X}' for b in frame)}")
+        # print(f"data bytes: {' '.join(f'{b:02X}' for b in data_bytes)}")
+
+        if len(data_bytes) < 15:
+            logger.warning(f"Joint DATA too short: expect ≥15 bytes, got {len(data_bytes)}")
+            return None
+
+        # Parse 6 joint angles
+        joint_values: List[float] = [0.0] * 6
+        joint_bytes = data_bytes
+        # print joint_bytes in hex
+        for i in range(6):
+            start = i * 2
+            joint_bytes = data_bytes[start:start + 2]
+            angle_rad = self._bytes_to_radians(joint_bytes)
+            joint_values[i] = angle_rad
+
+        gripper_low = data_bytes[12]
+        gripper_high = data_bytes[13]
+        gripper_raw = (gripper_low & 0xFF) | ((gripper_high & 0xFF) << 8)
+
+        # Map raw gripper value (0-1000) to percentage (0-100)
+        # Hardware uses 0-1000 range, convert to 0-100 percentage
+        gripper_value = int(max(0.0, min(1000, gripper_raw)))
+        # Parse run status (last mandatory byte)
+        run_status = data_bytes[14]
+        run_status_map = {
+            0x00: "idle",
+            0x01: "locked",
+            0x10: "sync",
+            0x11: "sync_locked",
+            0xE1: "overheat",
+            0xE2: "overheat_protect",
         }
-        
-        # 初始化关节角度数组
-        joint_values = [0.0] * 6
-        servo_values = []
-        
-        # 处理9个舵机数据
-        for i in range(9):
-            # 数据索引计算
-            byte_idx = 3 + i * 2
-            if byte_idx + 1 >= len(frame):
-                logger.warning(f"舵机数据越界: 索引{byte_idx}超出范围")
-                continue
-            
-            # 解析舵机原始值
-            low_byte = frame[byte_idx]
-            high_byte = frame[byte_idx + 1]
-            servo_value = (low_byte & 0xFF) | ((high_byte & 0xFF) << 8)
-            servo_values.append(servo_value)
-            
-            # 映射到关节
-            mapping = servo_to_joint_map.get(i)
-            if mapping is not None:
-                joint_idx, direction = mapping
-                # 转换为弧度并应用方向系数
-                angle_rad = self._value_to_radians(servo_value) * direction
-                joint_values[joint_idx] = angle_rad
-        
-        # 更新存储的数据
-        self._update_joint_state(angles=joint_values)
-        
+        run_status_text = run_status_map.get(run_status, "unknown")
+        # print("run_status_text:", run_status_text)
+        # Store run status
+        with self._lock:
+            self._run_status = run_status
+            self._run_status_text = run_status_text
+
+        # Update stored joint & gripper state
+        self._update_joint_state(angles=joint_values, gripper=gripper_value, run_status_text=run_status_text)
+
+        # Signal that joint state has been updated
+        self._joint_event.set()
+
         if self.debug_mode:
             degrees = [round(rad * self.RAD_TO_DEG, 2) for rad in joint_values]
-            logger.debug(f"关节角度(度): {degrees}")
-        
+            logger.debug(
+                f"Joint angles (deg): {degrees}, "
+                f"gripper={gripper_value}, "
+                f"run_status=0x{run_status:02X}({run_status_text})"
+            )
+
         return {
             "type": "joint_data",
             "angles": self._joint_states.angles,
-            "servo_values": servo_values,
-            "timestamp": self._joint_states.timestamp
+            "gripper": self._joint_states.gripper,
+            "run_status": run_status,
+            "run_status_text": run_status_text,
+            "timestamp": self._joint_states.timestamp,
         }
 
-    def _value_to_radians(self, value: int) -> float:
+    def _parse_temperature_data(self, frame: List[int]) -> Dict:
         """
-        将舵机值转换为弧度值 - 与ROS代码保持一致
-        
-        Args:
-            value: 舵机值(0-4095)
-            
-        Returns:
-            float: 弧度值
-        """
-        try:
-            # 值范围检查
-            if value < 0 or value > 4095:
-                logger.warning(f"舵机值超出范围: {value} (有效范围0-4095)")
-                value = max(0, min(value, 4095))
-            
-            # 转换为角度: -180到+180度
-            # 使用与ROS代码一致的转换公式
-            angle_deg = -180.0 + (value / 2048.0) * 180.0
-            
-            # 转换为弧度并返回
-            return angle_deg * self.DEG_TO_RAD
-                
-        except Exception as e:
-            logger.error(f"值转换异常: {str(e)}")
-            return 0.0
-    
-    def _parse_gripper_data_old(self, frame: List[int]) -> Dict:
-        """
-        解析夹爪数据帧 (0x02)
-        
-        Args:
-            frame: 完整的数据帧
-            
-        Returns:
-            Dict: 解析结果
-        """
-        # 解析按钮状态 (如果数据帧中包含)
-        button1 = False
-        button2 = False
-        if len(frame) >= 10:  # 确保有足够的数据
-            # 假设第8、9个字节包含按钮状态信息
-            button1 = (frame[8] & 0x01) != 0
-            button2 = (frame[9] & 0x01) != 0
+        Parse temperature data frame (CMD=0x06, FUNC=0x01).
 
-        # 检查最小长度
-        if len(frame) < 8:
-            logger.warning("夹爪数据帧长度不足")
+        :param frame: Complete data frame
+        """
+        data_len = frame[3]
+        expected_min_len = 4 + data_len + 2
+        if len(frame) < expected_min_len:
+            logger.warning(f"Temperature frame length mismatch: LEN={data_len}, frame_len={len(frame)}")
             return None
-        
-        if button1:
-             gripper_raw = frame[6] | (frame[7] << 8)
-        # 从字节4-5提取夹爪角度
-        else:
-            gripper_raw = frame[4] | (frame[5] << 8)
 
-        if gripper_raw < 2048 or gripper_raw > self.servo_value_limit:
-            gripper_raw = max(2048, min(gripper_raw, self.servo_value_limit))
-        
-        # # 转换为0-100范围
-        # # 反向映射：2048(硬件打开) → 100, servo_value_limit(硬件关闭) → 0
-        ratio = (self.servo_value_limit - 2048) / 100
-        gripper_value = 100 - ((gripper_raw - 2048) / ratio)
+        data_start = 4
+        data_end = data_start + data_len
+        data_bytes = frame[data_start:data_end]
 
-        # 更新存储的数据
-        self._update_joint_state(gripper=gripper_value, button1=button1,
-                                 button2=button2)
-        
+        # Parse temperature values (each byte represents temperature in Celsius)
+        temperatures = [float(byte) for byte in data_bytes]
 
-        return {
-            "type": "gripper_data",
-            "gripper_angle": self._joint_states.gripper,
-            "button1": self._joint_states.button1,
-            "button2": self._joint_states.button2,
-            "timestamp": self._joint_states.timestamp
-        }
-    
+        # Store temperature data
+        with self._lock:
+            self._temperature_data = temperatures
+            self._temperature_timestamp = time.time()
 
+        # Signal that temperature data has been updated
+        self._temperature_event.set()
 
-
-    def _parse_gripper_data(self, frame: List[int], robot_type: str = "follower") -> Dict:
-        """
-        解析夹爪数据帧 (0x12)
-        
-        协议格式:
-        | 0xAA | 0x12 | 0x07 | 0x01 | range_low | range_high | pot_low | pot_high | sync_btn | attitude_btn | checksum | 0xFF |
-        
-        Args:
-            frame: 完整的数据帧
-            
-        Returns:
-            Dict: 解析结果
-        """
-        # 检查最小长度 (需要至少12字节: header + cmd + len + suite + 4 data + 2 buttons + checksum + footer)
-        if len(frame) < 12:
-            logger.warning(f"夹爪数据帧长度不足: 需要至少12字节，实际{len(frame)}字节")
-            return None
-        
-        # 验证帧头
-        if frame[0] != 0xAA:
-            logger.warning(f"夹爪数据帧头错误: 期望0xAA，实际0x{frame[0]:02X}")
-            return None
-        
-        # 验证命令ID
-        if frame[1] != self.CMD_GRIPPER_V6:
-            logger.warning(f"夹爪数据帧命令ID错误: 期望0x{self.CMD_GRIPPER_V6:02X}，实际0x{frame[1]:02X}")
-            return None
-        
-        # 验证帧尾
-        if frame[-1] != 0xFF:
-            logger.warning(f"夹爪数据帧尾错误: 期望0xFF，实际0x{frame[-1]:02X}")
-            return None
-        
-        # 解析夹爪范围值 (字节4-5，用于验证，应与发送值相同)
-        gripper_range_low = frame[4]
-        gripper_range_high = frame[5]
-        gripper_raw = gripper_range_low | (gripper_range_high << 8)
-        
-        # 解析电位计值 (字节6-7，这是实际的夹爪位置值)
-        potentiometer_low = frame[6]
-        potentiometer_high = frame[7]
-        potentiomete_raw = potentiometer_low | (potentiometer_high << 8)
-        
-        button1 = frame[8]  # 同步按键状态
-        button2 = frame[9]  # 姿态按键状态
-        if robot_type == "leader" or button1:
-            gripper_raw = potentiomete_raw
-
-        ratio = (self.servo_value_limit - 2048) / 100
-        gripper_value = 100 - ((gripper_raw - 2048) / ratio)
-        # clip gripper_value to 0-100, round to 2 decimal places
-        gripper_value = round(max(0, min(gripper_value, 100)), 2)
-        self._update_joint_state(gripper=gripper_value, button1=button1,
-                                 button2=button2)
-        
         if self.debug_mode:
-            logger.debug(f"夹爪数据: 范围值={gripper_raw}, 位置值={gripper_raw}, "
-                        f"同步按键={'按下' if button1 else '未按下'}, "
-                        f"姿态按键={'按下' if button2 else '未按下'}")
-        
+            logger.debug(f"Temperature data: {temperatures}°C")
+
         return {
-            "type": "gripper_data",
-            "gripper_angle": self._joint_states.gripper,
-            "gripper_raw": gripper_raw,
-            "button1": self._joint_states.button1,
-            "button2": self._joint_states.button2,
-            "timestamp": self._joint_states.timestamp
+            "type": "temperature_data",
+            "temperatures": temperatures,
+            "timestamp": self._temperature_timestamp,
         }
-    
 
+    def _parse_velocity_data(self, frame: List[int]) -> Dict:
+        """
+        Parse velocity data frame (CMD=0x06, FUNC=0x02).
 
+        :param frame: Complete data frame
+        """
+        # print frame in hex
+        # print("Velocity frame:", " ".join(f"{b:02X}" for b in frame))
+        data_len = frame[3]
+        expected_min_len = 4 + data_len + 2
+        if len(frame) < expected_min_len:
+            logger.warning(f"Velocity frame length mismatch: LEN={data_len}, frame_len={len(frame)}")
+            return None
+
+        data_start = 4
+        data_end = data_start + data_len
+        data_bytes = frame[data_start:data_end]
+
+        # Parse velocity values (2 bytes per servo, low byte first)
+        num_servos = data_len // 2
+        velocities = []
+        for i in range(num_servos):
+            low_byte = data_bytes[i * 2]
+            high_byte = data_bytes[i * 2 + 1]
+            velocity_raw = (low_byte & 0xFF) | ((high_byte & 0xFF) << 8)
+            # Convert raw velocity to degrees per second
+            # Note: velocity_raw can exceed the expected limit of 5000
+            velocity_deg_s = self._raw_velocity_to_deg_per_sec(velocity_raw)
+            velocities.append(velocity_deg_s)
+
+        # Store velocity data
+        with self._lock:
+            self._velocity_data = velocities
+            self._velocity_timestamp = time.time()
+
+        # Signal that velocity data has been updated
+        self._velocity_event.set()
+
+        if self.debug_mode:
+            logger.debug(f"Velocity data (deg/s): {velocities}")
+
+        return {
+            "type": "velocity_data",
+            "velocities": velocities,
+            "timestamp": self._velocity_timestamp,
+        }
+
+    def _parse_self_check_data(self, frame: List[int]) -> Dict:
+        """
+        Parse machine self-check frame (CMD=0xFE, FUNC=0x00).
+
+        :param frame: Complete data frame
+        """
+        data_len = frame[3]
+        expected_min_len = 4 + data_len + 2
+        if len(frame) < expected_min_len:
+            logger.warning(f"Self-check frame length mismatch: LEN={data_len}, frame_len={len(frame)}")
+            return None
+
+        data_start = 4
+        data_end = data_start + data_len
+        data_bytes = frame[data_start:data_end]
+
+        if data_len < 2:
+            logger.warning(f"Self-check DATA too short: expect ≥2 bytes, got {data_len}")
+            return None
+
+        low = data_bytes[0]
+        high = data_bytes[1]
+        raw_mask = (low & 0xFF) | ((high & 0xFF) << 8)
+        # Decode to boolean list (LSB first), up to 16 bits to be safe
+        bits: List[bool] = [(raw_mask >> i) & 0x1 == 1 for i in range(10)]
+
+        with self._lock:
+            self._self_check_raw_mask = raw_mask
+            self._self_check_bits = bits
+            self._self_check_timestamp = time.time()
+
+        # Signal that self-check data has been updated
+        self._self_check_event.set()
+
+        if self.debug_mode:
+            logger.debug(
+                f"Self-check result: raw_mask=0x{raw_mask:04X}, "
+                f"bits={bits}"
+            )
+
+        return {
+            "type": "self_check_data",
+            "raw_mask": raw_mask,
+            "bits": bits,
+            "timestamp": self._self_check_timestamp,
+        }
 
     def _parse_error_data(self, frame: List[int]) -> Dict:
         """
-        解析错误数据帧 (0xEE)
-        
-        Args:
-            frame: 完整的数据帧
-            
-        Returns:
-            Dict: 解析结果
+        Parse error data frame (0xEE).
+
+        :param frame: Complete data frame
         """
-        # 检查最小长度
+        # Minimal length check
         if len(frame) < 7:
-            logger.warning("错误数据帧长度不足")
+            logger.warning("Error frame too short")
             return None
-        
-        # 提取错误码和附加信息
+
+        # Extract error code and parameter
         error_code = frame[3]
         error_param = frame[4]
-        
+
         error_types = {
-            0x00: "包头/包尾或长度错误",
-            0x01: "校验错误",
-            0x02: "模式错误",
-            0x03: "ID无效",
+            0x00: "Header/footer or length error",
+            0x01: "Checksum error",
+            0x02: "Mode error",
+            0x03: "Invalid ID",
         }
-        
-        error_message = error_types.get(error_code, f"未知错误(0x{error_code:02X})")
-        
-        logger.warning(f"设备错误: {error_message}, 参数: 0x{error_param:02X}")
-        
+
+        error_message = error_types.get(error_code, f"Unknown error (0x{error_code:02X})")
+
+        logger.warning(f"Device error: {error_message}, param: 0x{error_param:02X}")
+
         return {
             "type": "error_data",
             "error_code": error_code,
@@ -391,94 +465,170 @@ class DataParser:
             "error_message": error_message,
             "timestamp": time.time()
         }
-    
+
     def _parse_version_data(self, frame: List[int]) -> Dict:
         """
-        解析版本数据帧 (0x12)
-        
-        Args:
-            frame: 完整的数据帧
-            
-        Returns:
-            Dict: 解析结果
+        Parse version data frame (CMD=0x01).
+
+        :param frame: Complete data frame
         """
-        # 提取版本信息
-        version_str = f"{frame[3]}.{frame[4]}.{frame[5]}"
-        
-        # 存储版本信息
+        # Basic length check: header(1)+CMD(1)+func(1)+LEN(1)+DATA(LEN)+checksum(1)+footer(1)
+        if len(frame) < 4 + frame[3] + 2:
+            logger.warning(f"Version frame too short: expect ≥{4 + frame[3] + 2}, got {len(frame)}")
+            return None
+
+        data_len = frame[3]
+        data_start = 4
+        data_end = data_start + data_len
+        data_bytes = frame[data_start:data_end]
+
+        if data_len < 24:
+            logger.warning(f"Version data length too short: expect 24, got {data_len}")
+            return None
+
+        # Split fields according to protocol
+        serial_bytes = data_bytes[0:16]
+        hardware_bytes = data_bytes[16:20]
+        firmware_bytes = data_bytes[20:24]
+
+        def _bytes_to_ascii(b: List[int]) -> str:
+            try:
+                return "".join(chr(x) for x in b).strip()
+            except Exception as e:
+                logger.error(f"Version ASCII parse exception: {e}")
+                return ""
+
+        def _bytes_to_decimal(b: List[int]) -> int:
+            """Convert little-endian byte array to decimal integer."""
+            result = 0
+            for i, byte in enumerate(b):
+                result |= (byte & 0xFF) << (i * 8)
+            return result
+
+        # Parse serial number as ASCII string
+        serial_number = _bytes_to_ascii(serial_bytes)
+
+        # Parse hardware and firmware versions as little-endian decimal values
+        hardware_decimal = _bytes_to_decimal(hardware_bytes)
+        firmware_decimal = _bytes_to_decimal(firmware_bytes)
+
+        # Convert decimal values to version strings
+        hardware_str = self._decimal_to_version_string(hardware_decimal)
+        firmware_str = self._decimal_to_version_string(firmware_decimal)
+
+        # Store firmware version (for upper-level API)
         with self._lock:
-            self._firmware_version = version_str
-        
+            self._firmware_version = firmware_str
+            self._version_info = {
+                "serial_number": serial_number,
+                "hardware_version": hardware_str,
+                "firmware_version": firmware_str,
+            }
+
+        # Signal that version info has been received and parsed
+        self._version_event.set()
+
+        if self.debug_mode:
+            logger.debug(
+                f"Version parsed: SN='{serial_number}', HW={hardware_decimal}('{hardware_str}'), FW={firmware_decimal}('{firmware_str}')"
+            )
+
         return {
             "type": "version_data",
-            "version": version_str,
-            "timestamp": time.time()
+            "serial_number": serial_number,
+            "hardware_version": hardware_str,
+            "firmware_version_raw": firmware_decimal,
+            "version": firmware_str,
+            "timestamp": time.time(),
         }
-    
+
     def _bytes_to_radians(self, byte_array: List[int]) -> float:
         """
-        将字节数组转换为弧度值
-        
-        Args:
-            byte_array: 2字节数组
-            
-        Returns:
-            float: 弧度值
+        Convert 2-byte array (little endian) to radians directly.
+
+        :param byte_array: 2-byte array (little endian)
         """
-        try:
-            if len(byte_array) != 2:
-                logger.warning(f"数据长度错误：需要2个字节，实际{len(byte_array)}个字节")
-                return 0.0
-            
-            # 构造16位整数
-            hex_value = (byte_array[0] & 0xFF) | ((byte_array[1] & 0xFF) << 8)
-            
-            # 值范围检查
-            if hex_value < 0 or hex_value > 4095:
-                logger.warning(f"舵机值超出范围: {hex_value} (有效范围0-4095)")
-                hex_value = max(0, min(hex_value, 4095))
-            
-            # 转换为角度: -180到+180度
-            angle_deg = -180.0 + (hex_value / 2048.0) * 180.0
-            
-            # 转换为弧度并返回
-            return angle_deg * self.DEG_TO_RAD
-                
-        except Exception as e:
-            logger.error(f"字节转换异常: {str(e)}")
+        if len(byte_array) != 2:
+            logger.warning(f"Data length error: need 2 bytes, got {len(byte_array)}")
             return 0.0
-    
-    def _verify_checksum(self, frame: List[int]) -> bool:
+
+        # Build 16-bit integer
+        hex_value = (byte_array[0] & 0xFF) | ((byte_array[1] & 0xFF) << 8)
+        # print in hex
+        # print(f"hex_value: {hex_value}")
+        # Range check
+        if hex_value < 0 or hex_value > 4095:
+            logger.warning(f"Servo value out of range: {hex_value} (valid 0–4095)")
+            hex_value = max(0, min(hex_value, 4095))
+
+        # Directly map raw value to radians: 0–4095 -> [-π, π]
+        return (hex_value / 4096.0) * (2 * math.pi) - math.pi
+
+    def _value_to_radians(self, value: int) -> float:
         """
-        验证帧的校验和
-        
-        Args:
-            frame: 完整的数据帧
-            
-        Returns:
-            bool: 校验是否通过
+        Convert servo raw value to radians directly.
+
+        :param value: Servo raw value (0-4095)
         """
-        if len(frame) < 4:
-            return False
-        
-        # 计算从第3个字节到倒数第3个字节的所有元素之和
-        checksum = 0
-        for i in range(3, len(frame) - 2):
-            checksum += frame[i]
-        
-        checksum %= 2
-        received_checksum = frame[-2]
-        
-        return checksum == received_checksum
-    
-    def _bytes_to_hex(self, data: List[int]) -> str:
+        if value < 0 or value > 4095:
+            logger.warning(f"Servo value out of range: {value} (valid 0–4095)")
+            value = max(0, min(value, 4095))
+
+        # Directly map raw value to radians: 0–4095 -> [-π, π]
+        return (value / 4096.0) * (2 * math.pi) - math.pi
+
+    def _raw_velocity_to_deg_per_sec(self, velocity_raw: int) -> float:
         """
-        将字节数组转换为十六进制字符串
-        
-        Args:
-            data: 字节数组
-            
-        Returns:
-            str: 十六进制字符串
+        Convert raw velocity value to degrees per second.
+        :param velocity_raw: Raw velocity value from hardware
+        :return: Velocity in degrees per second
         """
-        return " ".join([f"{b:02X}" for b in data])
+        # Known mapping: 360 deg/s = 4096 ticks/s
+        # Ratio: 360 / 4096 = 0.087890625 deg/(tick/s)
+        DEG_PER_TICK_PER_SEC = 360.0 / 4096.0
+        
+        # Expected hardware range: 50-5000 ticks/s
+        MAX_HARDWARE_VALUE = 5000
+        
+        # Handle abnormal values that exceed the expected limit
+        if velocity_raw > MAX_HARDWARE_VALUE:
+            # Clamp abnormal values to maximum expected value
+            velocity_raw = MAX_HARDWARE_VALUE
+            if self.debug_mode:
+                logger.debug(
+                    f"Velocity raw value exceeds expected limit (5000), "
+                    f"clamped to {MAX_HARDWARE_VALUE} before conversion"
+                )
+        
+        # Convert raw value to degrees per second
+        velocity_deg_s = velocity_raw * DEG_PER_TICK_PER_SEC
+        
+        return velocity_deg_s
+
+    def _decimal_to_version_string(self, decimal_value: int) -> str:
+        """
+        Convert decimal value to version string.
+        :param decimal_value: Decimal version value
+        :return: Version string in format "X.YZ"
+        """
+        if decimal_value < 0:
+            return "unknown"
+        
+        # Convert to string and pad with zeros if needed
+        decimal_str = str(decimal_value)
+        
+        if len(decimal_str) == 1:
+            # Single digit: 6 -> "0.06"
+            version_str = f"0.0{decimal_str}"
+        elif len(decimal_str) == 2:
+            # Two digits: 10 -> "0.10"
+            version_str = f"0.{decimal_str}"
+        elif len(decimal_str) >= 3:
+            # Three or more digits: 610 -> "6.10", 1234 -> "12.34"
+            major = decimal_str[:-2]
+            minor = decimal_str[-2:]
+            version_str = f"{major}.{minor}"
+        else:
+            version_str = "unknown"
+        
+        return version_str

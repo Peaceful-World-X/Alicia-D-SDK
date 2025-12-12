@@ -16,11 +16,11 @@ Usage examples:
 python 09_demo_drag_teaching.py --list-motions
 
 # Record new motions
-python 09_demo_drag_teaching.py --port /dev/ttyUSB0 --mode auto --save-motion my_demo
-python 09_demo_drag_teaching.py --port /dev/ttyUSB0 --mode manual --save-motion key_points
+python 09_demo_drag_teaching.py --mode auto --save-motion my_demo
+python 09_demo_drag_teaching.py --mode manual --save-motion key_points
 
 # Replay existing motions
-python 09_demo_drag_teaching.py --port /dev/ttyUSB0 --mode replay_only --save-motion my_demo
+python 09_demo_drag_teaching.py --mode replay_only --save-motion my_demo
 
 # Get help
 python 09_demo_drag_teaching.py --help
@@ -43,8 +43,6 @@ from alicia_d_sdk.execution.drag_teaching import print_available_motions, list_a
 
 def main(args):
     """Demonstrate drag teaching functionality.
-    
-    :param args: Command line arguments containing port, baudrate, version, gripper_type, mode, sample_hz, save_motion, and list_motions
     """
     
     # If the user requests to list motions, display and exit
@@ -63,13 +61,7 @@ def main(args):
         print("使用 --list-motions 查看可用动作")
         return
 
-    robot = create_robot(
-        port=args.port,
-        baudrate=args.baudrate,
-        robot_version=args.robot_version,
-        gripper_type=args.gripper_type, 
-        speed_deg_s = 30.0
-    )
+    robot = create_robot(port=args.port)
 
     if not robot.connect():
         print("Unable to connect to the robot")
@@ -84,15 +76,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="拖动示教", 
                                    formatter_class=argparse.RawDescriptionHelpFormatter,)
     # Robot configuration
-    parser.add_argument('--port', type=str, default="/dev/ttyUSB0", help="串口端口 (例如: /dev/ttyUSB0 或 COM3)")
-    parser.add_argument('--baudrate', type=int, default=1000000,  help="波特率 (默认: 1000000)")
-    parser.add_argument('--robot_version', type=str, default="v5_6",  help="机器人版本 (默认: v5_6)")
-    parser.add_argument('--gripper_type', type=str, default="50mm",  help="夹爪型号 (默认: 50mm)")
-    parser.add_argument('--speed', type=float, default=1,  help="运动速度因子 (0.0 ~ 1.0, 默认: 0.5)")
-    
+    parser.add_argument('--port', type=str, default="", help="串口端口 (例如: /dev/ttyUSB0 或 COM3)")
+    parser.add_argument('--speed_deg_s', type=int, default=10,  help="关节运动速度 (单位: 度/秒，默认: 10，范围: 5-400度/秒)")
+
     parser.add_argument('--mode', choices=['manual', 'auto', 'replay_only'], default='auto', 
                        help="模式: manual(手动插值) 或 auto(自动快速) 或 replay_only(仅回放)")
-    parser.add_argument('--sample-hz', type=float, default=50.0, help="自动模式采样频率")
+    parser.add_argument('--sample-hz', type=float, default=300.0, help="自动模式采样频率")
     parser.add_argument('--save-motion', help="动作名称 (录制模式: 新动作名; 回放模式: 已有动作名)")
     parser.add_argument('--list-motions', action='store_true',  help="列出所有可用的动作并退出")
     args = parser.parse_args()
